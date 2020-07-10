@@ -24,9 +24,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coreos/etcd/client"
-
 	"github.com/XiaoMi/Gaea/log"
+	"go.etcd.io/etcd/clientv3"
 )
 
 // ErrClosedEtcdClient means etcd client closed
@@ -39,11 +38,11 @@ const (
 // EtcdClient etcd client
 type EtcdClient struct {
 	sync.Mutex
-	kapi client.KeysAPI
-
+	client  *clientv3.Client
 	closed  bool
 	timeout time.Duration
 	Prefix  string
+	lease   map[string]clientv3.LeaseID
 }
 
 // New constructor of EtcdClient
@@ -54,14 +53,13 @@ func New(addr string, timeout time.Duration, username, passwd, root string) (*Et
 			endpoints[i] = "http://" + s
 		}
 	}
-	config := client.Config{
-		Endpoints:               endpoints,
-		Transport:               client.DefaultTransport,
-		Username:                username,
-		Password:                passwd,
-		HeaderTimeoutPerRequest: time.Second * 10,
+	config := clientv3.Config{
+		Endpoints:   endpoints,
+		Username:    username,
+		Password:    passwd,
+		DialTimeout: time.Second * 10,
 	}
-	c, err := client.New(config)
+	c, err := clientv3.New(config)
 	if err != nil {
 		return nil, err
 	}
@@ -69,9 +67,10 @@ func New(addr string, timeout time.Duration, username, passwd, root string) (*Et
 		root = defaultEtcdPrefix
 	}
 	return &EtcdClient{
-		kapi:    client.NewKeysAPI(c),
+		client:  c,
 		timeout: timeout,
 		Prefix:  root,
+		lease:   make(map[string]clientv3.LeaseID),
 	}, nil
 }
 
@@ -93,24 +92,6 @@ func (c *EtcdClient) contextWithTimeout() (context.Context, context.CancelFunc) 
 	return context.WithTimeout(context.Background(), c.timeout)
 }
 
-func isErrNoNode(err error) bool {
-	if err != nil {
-		if e, ok := err.(client.Error); ok {
-			return e.Code == client.ErrorCodeKeyNotFound
-		}
-	}
-	return false
-}
-
-func isErrNodeExists(err error) bool {
-	if err != nil {
-		if e, ok := err.(client.Error); ok {
-			return e.Code == client.ErrorCodeNodeExist
-		}
-	}
-	return false
-}
-
 // Mkdir create directory
 func (c *EtcdClient) Mkdir(dir string) error {
 	c.Lock()
@@ -127,11 +108,9 @@ func (c *EtcdClient) mkdir(dir string) error {
 	}
 	cntx, canceller := c.contextWithTimeout()
 	defer canceller()
-	_, err := c.kapi.Set(cntx, dir, "", &client.SetOptions{Dir: true, PrevExist: client.PrevNoExist})
+
+	_, err := c.client.Put(cntx, dir, "")
 	if err != nil {
-		if isErrNodeExists(err) {
-			return nil
-		}
 		return err
 	}
 	return nil
@@ -147,7 +126,7 @@ func (c *EtcdClient) Create(path string, data []byte) error {
 	cntx, canceller := c.contextWithTimeout()
 	defer canceller()
 	log.Debug("etcd create node %s", path)
-	_, err := c.kapi.Set(cntx, path, string(data), &client.SetOptions{PrevExist: client.PrevNoExist})
+	_, err := c.client.Put(cntx, path, string(data))
 	if err != nil {
 		log.Debug("etcd create node %s failed: %s", path, err)
 		return err
@@ -166,7 +145,7 @@ func (c *EtcdClient) Update(path string, data []byte) error {
 	cntx, canceller := c.contextWithTimeout()
 	defer canceller()
 	log.Debug("etcd update node %s", path)
-	_, err := c.kapi.Set(cntx, path, string(data), &client.SetOptions{PrevExist: client.PrevIgnore})
+	_, err := c.client.Put(cntx, path, string(data))
 	if err != nil {
 		log.Debug("etcd update node %s failed: %s", path, err)
 		return err
@@ -185,7 +164,15 @@ func (c *EtcdClient) UpdateWithTTL(path string, data []byte, ttl time.Duration) 
 	cntx, canceller := c.contextWithTimeout()
 	defer canceller()
 	log.Debug("etcd update node %s with ttl %d", path, ttl)
-	_, err := c.kapi.Set(cntx, path, string(data), &client.SetOptions{PrevExist: client.PrevIgnore, TTL: ttl})
+	if _, ex := c.lease[path]; !ex {
+		res, err := c.client.Grant(cntx, int64(ttl.Seconds()))
+		if err != nil {
+			return err
+		}
+		c.lease[path] = res.ID
+	}
+
+	_, err := c.client.Put(cntx, path, string(data), clientv3.WithLease(c.lease[path]))
 	if err != nil {
 		log.Debug("etcd update node %s failed: %s", path, err)
 		return err
@@ -204,8 +191,8 @@ func (c *EtcdClient) Delete(path string) error {
 	cntx, canceller := c.contextWithTimeout()
 	defer canceller()
 	log.Debug("etcd delete node %s", path)
-	_, err := c.kapi.Delete(cntx, path, nil)
-	if err != nil && !isErrNoNode(err) {
+	_, err := c.client.Delete(cntx, path)
+	if err != nil {
 		log.Debug("etcd delete node %s failed: %s", path, err)
 		return err
 	}
@@ -223,14 +210,14 @@ func (c *EtcdClient) Read(path string) ([]byte, error) {
 	cntx, canceller := c.contextWithTimeout()
 	defer canceller()
 	log.Debug("etcd read node %s", path)
-	r, err := c.kapi.Get(cntx, path, nil)
-	if err != nil && !isErrNoNode(err) {
+	r, err := c.client.Get(cntx, path)
+	if err != nil {
 		return nil, err
-	} else if r == nil || r.Node.Dir {
-		return nil, nil
-	} else {
-		return []byte(r.Node.Value), nil
 	}
+	if len(r.Kvs) == 0 || len(r.Kvs) > 1 {
+		return nil, nil
+	}
+	return r.Kvs[0].Value, nil
 }
 
 // List list path, return slice of all paths
@@ -243,34 +230,37 @@ func (c *EtcdClient) List(path string) ([]string, error) {
 	cntx, canceller := c.contextWithTimeout()
 	defer canceller()
 	log.Debug("etcd list node %s", path)
-	r, err := c.kapi.Get(cntx, path, nil)
-	if err != nil && !isErrNoNode(err) {
+	r, err := c.client.Get(cntx, path, clientv3.WithPrefix())
+	if err != nil {
 		return nil, err
-	} else if r == nil || !r.Node.Dir {
-		return nil, nil
-	} else {
-		var files []string
-		for _, node := range r.Node.Nodes {
-			files = append(files, node.Key)
-		}
-		return files, nil
 	}
+
+	result := make([]string, len(r.Kvs))
+	for i, v := range r.Kvs {
+		result[i] = string(v.Key)
+	}
+	return result, nil
 }
 
-// Watch watch path
+// v.Key watch path
 func (c *EtcdClient) Watch(path string, ch chan string) error {
 	c.Lock()
 	defer c.Unlock()
 	if c.closed {
 		panic(ErrClosedEtcdClient)
 	}
-	watcher := c.kapi.Watcher(path, &client.WatcherOptions{Recursive: true})
+	watcher := c.client.Watch(context.Background(), path, clientv3.WithPrefix())
 	for {
-		res, err := watcher.Next(context.Background())
-		if err != nil {
+		res := <-watcher
+		if err := res.Err(); err != nil {
 			panic(err)
 		}
-		ch <- res.Action
+		action := res.Events[0].Type
+		if action == clientv3.EventTypePut {
+			ch <- "set"
+		} else if action == clientv3.EventTypeDelete {
+			ch <- "delete"
+		}
 	}
 }
 
